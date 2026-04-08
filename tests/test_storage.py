@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from rageval.core.models import (
@@ -162,3 +164,58 @@ class TestQueryResults:
     def test_query_empty_run(self, store: ResultStore) -> None:
         results = store.query_results("nonexistent")
         assert len(results) == 0
+
+    def test_query_by_faithfulness(self, store: ResultStore) -> None:
+        results = [
+            _make_result("s1", faithfulness=0.2),
+            _make_result("s2", faithfulness=0.8),
+            _make_result("s3", faithfulness=0.9),
+        ]
+        store.store_results("run-1", results)
+        filtered = store.query_results("run-1", min_faithfulness=0.5)
+        assert len(filtered) == 2
+
+
+class TestExportJson:
+    """Test JSON export functionality."""
+
+    def test_export_creates_file(self, store: ResultStore, tmp_path: Path) -> None:
+        """Export should create a valid JSON file."""
+        import json
+
+        results = [_make_result("s1"), _make_result("s2")]
+        store.store_results("run-1", results)
+
+        out_path = str(tmp_path / "export.json")
+        count = store.export_json("run-1", out_path)
+        assert count == 2
+
+        with open(out_path) as f:
+            data = json.load(f)
+
+        assert data["run_id"] == "run-1"
+        assert data["summary"]["sample_count"] == 2
+        assert len(data["results"]) == 2
+
+    def test_export_empty_run(self, store: ResultStore, tmp_path: Path) -> None:
+        """Exporting a nonexistent run should create a file with 0 results."""
+        out_path = str(tmp_path / "empty.json")
+        count = store.export_json("nonexistent", out_path)
+        assert count == 0
+
+
+class TestListRuns:
+    """Test listing all runs."""
+
+    def test_list_runs(self, store: ResultStore) -> None:
+        store.store_results("run-a", [_make_result("s1")])
+        store.store_results("run-b", [_make_result("s2"), _make_result("s3")])
+
+        runs = store.list_runs()
+        assert len(runs) == 2
+        run_ids = {r["run_id"] for r in runs}
+        assert run_ids == {"run-a", "run-b"}
+
+    def test_list_runs_empty(self, store: ResultStore) -> None:
+        runs = store.list_runs()
+        assert len(runs) == 0

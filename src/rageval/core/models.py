@@ -22,6 +22,14 @@ class EvalStatus(StrEnum):
     FAILED = "failed"
 
 
+class EvalMode(StrEnum):
+    """Which evaluation mode produced the generation metrics."""
+
+    LLM_JUDGE = "llm_judge"
+    HEURISTIC = "heuristic"
+    NONE = "none"
+
+
 class RetrievalMetrics(BaseModel):
     """Retrieval quality metrics for a single sample.
 
@@ -95,11 +103,21 @@ class GenerationMetrics(BaseModel):
         le=1.0,
         description="Semantic similarity to the reference answer",
     )
+    rouge_l: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="ROUGE-L F1 score vs reference (word-order-aware similarity)",
+    )
     context_utilization: float = Field(
         default=0.0,
         ge=0.0,
         le=1.0,
         description="How well the answer uses relevant retrieved context",
+    )
+    eval_mode: EvalMode = Field(
+        default=EvalMode.NONE,
+        description="Which evaluation mode produced these metrics",
     )
 
 
@@ -171,6 +189,7 @@ class EvalRunSummary(BaseModel):
     avg_faithfulness: float = Field(default=0.0, ge=0.0, le=1.0)
     avg_relevance: float = Field(default=0.0, ge=0.0, le=1.0)
     avg_correctness: float = Field(default=0.0, ge=0.0, le=1.0)
+    avg_rouge_l: float = Field(default=0.0, ge=0.0, le=1.0)
     avg_context_utilization: float = Field(default=0.0, ge=0.0, le=1.0)
     # Timing
     avg_latency_ms: float = Field(default=0.0, ge=0.0)
