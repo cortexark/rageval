@@ -1,9 +1,10 @@
-"""Tests for generation quality metrics (faithfulness, relevance, correctness)."""
+"""Tests for generation quality metrics (faithfulness, relevance, correctness, ROUGE-L)."""
 
 from __future__ import annotations
 
 import pytest
 
+from rageval.core.models import EvalMode
 from rageval.metrics.generation import GenerationEvaluator
 
 
@@ -174,6 +175,61 @@ class TestBatchEvaluation:
         assert results[0].context_utilization >= 0.0
 
 
+class TestRougeL:
+    """ROUGE-L integration in generation metrics."""
+
+    def test_rouge_l_with_reference(self, evaluator: GenerationEvaluator) -> None:
+        """ROUGE-L should be computed when reference is provided."""
+        result = evaluator.evaluate(
+            query="What is RAG?",
+            generated_answer="RAG combines retrieval with generation for better answers",
+            retrieved_contexts=["RAG is a technique."],
+            reference_answer="RAG combines retrieval with generation",
+        )
+        assert result.rouge_l > 0.5
+
+    def test_rouge_l_without_reference(self, evaluator: GenerationEvaluator) -> None:
+        """ROUGE-L should be 0 when no reference is provided."""
+        result = evaluator.evaluate(
+            query="What is RAG?",
+            generated_answer="RAG combines retrieval with generation",
+            retrieved_contexts=["RAG is a technique."],
+        )
+        assert result.rouge_l == 0.0
+
+    def test_rouge_l_identical(self, evaluator: GenerationEvaluator) -> None:
+        """Identical answer and reference should give ROUGE-L = 1.0."""
+        result = evaluator.evaluate(
+            query="What is 2+2?",
+            generated_answer="The answer is four",
+            retrieved_contexts=["Basic arithmetic."],
+            reference_answer="The answer is four",
+        )
+        assert result.rouge_l == 1.0
+
+
+class TestEvalMode:
+    """Test evaluation mode tracking."""
+
+    def test_heuristic_mode_tracked(self, evaluator: GenerationEvaluator) -> None:
+        """Heuristic evaluator should report its mode."""
+        result = evaluator.evaluate(
+            query="What is RAG?",
+            generated_answer="RAG is a technique",
+            retrieved_contexts=["RAG is a technique."],
+        )
+        assert result.eval_mode == EvalMode.HEURISTIC
+
+    def test_mode_property(self, evaluator: GenerationEvaluator) -> None:
+        """Mode property should reflect configuration."""
+        assert evaluator.mode == EvalMode.HEURISTIC
+
+    def test_llm_mode_when_configured(self) -> None:
+        """Evaluator with API key should report LLM mode."""
+        llm_eval = GenerationEvaluator(api_key="test-key-123")
+        assert llm_eval.mode == EvalMode.LLM_JUDGE
+
+
 class TestEdgeCases:
     """Edge cases for generation evaluation."""
 
@@ -185,6 +241,7 @@ class TestEdgeCases:
         )
         assert result.faithfulness == 0.0
         assert result.relevance == 0.0
+        assert result.rouge_l == 0.0
 
     def test_empty_query(self, evaluator: GenerationEvaluator) -> None:
         result = evaluator.evaluate(

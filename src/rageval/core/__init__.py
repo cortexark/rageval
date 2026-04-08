@@ -2,6 +2,7 @@
 
 from rageval.core.config import EvalConfig, LLMProviderConfig
 from rageval.core.models import (
+    EvalMode,
     EvalResult,
     EvalSample,
     GenerationMetrics,
@@ -10,6 +11,7 @@ from rageval.core.models import (
 
 __all__ = [
     "EvalConfig",
+    "EvalMode",
     "EvalResult",
     "EvalSample",
     "GenerationMetrics",

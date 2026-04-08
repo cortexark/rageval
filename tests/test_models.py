@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from rageval.core.config import EvalConfig, LLMProviderConfig, RetrieverConfig
 from rageval.core.models import (
+    EvalMode,
     EvalResult,
     EvalRunSummary,
     EvalSample,
@@ -73,16 +74,22 @@ class TestGenerationMetrics:
         assert metrics.faithfulness == 0.0
         assert metrics.relevance == 0.0
         assert metrics.correctness == 0.0
+        assert metrics.rouge_l == 0.0
         assert metrics.context_utilization == 0.0
+        assert metrics.eval_mode == EvalMode.NONE
 
     def test_valid_scores(self) -> None:
         metrics = GenerationMetrics(
             faithfulness=0.9,
             relevance=0.85,
             correctness=0.7,
+            rouge_l=0.8,
             context_utilization=0.6,
+            eval_mode=EvalMode.HEURISTIC,
         )
         assert metrics.faithfulness == 0.9
+        assert metrics.rouge_l == 0.8
+        assert metrics.eval_mode == EvalMode.HEURISTIC
 
     def test_rejects_out_of_range(self) -> None:
         with pytest.raises(ValidationError):
@@ -91,6 +98,19 @@ class TestGenerationMetrics:
     def test_rejects_negative(self) -> None:
         with pytest.raises(ValidationError):
             GenerationMetrics(relevance=-0.1)
+
+    def test_rejects_rouge_l_out_of_range(self) -> None:
+        with pytest.raises(ValidationError):
+            GenerationMetrics(rouge_l=1.5)
+
+
+class TestEvalMode:
+    """Test EvalMode enum."""
+
+    def test_values(self) -> None:
+        assert EvalMode.LLM_JUDGE == "llm_judge"
+        assert EvalMode.HEURISTIC == "heuristic"
+        assert EvalMode.NONE == "none"
 
 
 class TestEvalSample:

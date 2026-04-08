@@ -1,11 +1,12 @@
 """DuckDB-backed result storage for evaluation runs.
 
-Provides persistent storage, querying, and comparison of evaluation
-results across runs, models, and dataset versions.
+Provides persistent storage, querying, comparison, and export of
+evaluation results across runs, models, and dataset versions.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import duckdb
@@ -19,12 +20,17 @@ logger = structlog.get_logger(__name__)
 class ResultStore:
     """Store and query evaluation results in DuckDB.
 
+    Supports both in-memory (for tests) and file-backed (for production)
+    databases. Provides SQL-powered aggregation, cross-run comparison,
+    filtered queries, and JSON export.
+
     Example::
 
         store = ResultStore(db_path=":memory:")
         store.store_results("run-1", results)
         summary = store.get_run_summary("run-1")
         print(f"Avg F1: {summary.avg_f1:.3f}")
+        store.export_json("run-1", "/tmp/run-1-results.json")
     """
 
     def __init__(self, *, db_path: str = ":memory:") -> None:
@@ -56,7 +62,9 @@ class ResultStore:
                 faithfulness DOUBLE DEFAULT 0,
                 relevance DOUBLE DEFAULT 0,
                 correctness DOUBLE DEFAULT 0,
+                rouge_l DOUBLE DEFAULT 0,
                 context_utilization DOUBLE DEFAULT 0,
+                eval_mode VARCHAR DEFAULT 'none',
                 -- Timing
                 latency_ms DOUBLE DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -78,6 +86,7 @@ class ResultStore:
                 avg_faithfulness DOUBLE DEFAULT 0,
                 avg_relevance DOUBLE DEFAULT 0,
                 avg_correctness DOUBLE DEFAULT 0,
+                avg_rouge_l DOUBLE DEFAULT 0,
                 avg_context_utilization DOUBLE DEFAULT 0,
                 avg_latency_ms DOUBLE DEFAULT 0,
                 total_duration_seconds DOUBLE DEFAULT 0,
@@ -88,6 +97,9 @@ class ResultStore:
 
     def store_results(self, run_id: str, results: list[EvalResult]) -> int:
         """Store evaluation results for a run.
+
+        Uses INSERT OR REPLACE for idempotent upserts — re-running
+        an evaluation on the same samples updates rather than duplicates.
 
         Args:
             run_id: Unique identifier for this evaluation run.
@@ -104,8 +116,9 @@ class ResultStore:
                     generated_answer, precision, recall, f1_score,
                     mrr, ndcg, hit_rate, retrieved_count, relevant_count,
                     relevant_retrieved_count, faithfulness, relevance,
-                    correctness, context_utilization, latency_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    correctness, rouge_l, context_utilization, eval_mode,
+                    latency_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     result.id,
@@ -126,7 +139,9 @@ class ResultStore:
                     result.generation_metrics.faithfulness,
                     result.generation_metrics.relevance,
                     result.generation_metrics.correctness,
+                    result.generation_metrics.rouge_l,
                     result.generation_metrics.context_utilization,
+                    result.generation_metrics.eval_mode.value,
                     result.latency_ms,
                     result.created_at.isoformat(),
                 ],
@@ -136,7 +151,9 @@ class ResultStore:
         return len(results)
 
     def get_run_summary(self, run_id: str) -> EvalRunSummary:
-        """Compute aggregate metrics for a run.
+        """Compute aggregate metrics for a run via SQL.
+
+        Uses DuckDB's AVG() aggregation — no materializing rows into Python.
 
         Args:
             run_id: The run to summarize.
@@ -157,6 +174,7 @@ class ResultStore:
                 AVG(faithfulness) as avg_faithfulness,
                 AVG(relevance) as avg_relevance,
                 AVG(correctness) as avg_correctness,
+                AVG(rouge_l) as avg_rouge_l,
                 AVG(context_utilization) as avg_context_utilization,
                 AVG(latency_ms) as avg_latency_ms
             FROM eval_results
@@ -181,12 +199,15 @@ class ResultStore:
             avg_faithfulness=row[7] or 0.0,
             avg_relevance=row[8] or 0.0,
             avg_correctness=row[9] or 0.0,
-            avg_context_utilization=row[10] or 0.0,
-            avg_latency_ms=row[11] or 0.0,
+            avg_rouge_l=row[10] or 0.0,
+            avg_context_utilization=row[11] or 0.0,
+            avg_latency_ms=row[12] or 0.0,
         )
 
     def compare_runs(self, run_id_a: str, run_id_b: str) -> dict[str, dict[str, float]]:
         """Compare two evaluation runs side by side.
+
+        Computes delta (candidate - baseline) for every metric.
 
         Args:
             run_id_a: First run (baseline).
@@ -209,6 +230,7 @@ class ResultStore:
             "avg_faithfulness",
             "avg_relevance",
             "avg_correctness",
+            "avg_rouge_l",
             "avg_context_utilization",
         ]
 
@@ -230,14 +252,27 @@ class ResultStore:
         *,
         min_f1: float | None = None,
         max_f1: float | None = None,
+        min_faithfulness: float | None = None,
+        max_faithfulness: float | None = None,
+        min_rouge_l: float | None = None,
+        max_rouge_l: float | None = None,
+        eval_mode: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Query results with optional filters.
+        """Query results with flexible filters.
+
+        Supports filtering on any metric range, evaluation mode, and
+        result count limit.
 
         Args:
             run_id: Run to query.
             min_f1: Minimum F1 score filter.
             max_f1: Maximum F1 score filter.
+            min_faithfulness: Minimum faithfulness filter.
+            max_faithfulness: Maximum faithfulness filter.
+            min_rouge_l: Minimum ROUGE-L filter.
+            max_rouge_l: Maximum ROUGE-L filter.
+            eval_mode: Filter by evaluation mode ('llm_judge' or 'heuristic').
             limit: Max results to return.
 
         Returns:
@@ -246,12 +281,20 @@ class ResultStore:
         conditions = ["run_id = ?"]
         params: list[Any] = [run_id]
 
-        if min_f1 is not None:
-            conditions.append("f1_score >= ?")
-            params.append(min_f1)
-        if max_f1 is not None:
-            conditions.append("f1_score <= ?")
-            params.append(max_f1)
+        filter_map: list[tuple[str, str, float | str | None]] = [
+            ("f1_score >= ?", "f1_score >= ?", min_f1),
+            ("f1_score <= ?", "f1_score <= ?", max_f1),
+            ("faithfulness >= ?", "faithfulness >= ?", min_faithfulness),
+            ("faithfulness <= ?", "faithfulness <= ?", max_faithfulness),
+            ("rouge_l >= ?", "rouge_l >= ?", min_rouge_l),
+            ("rouge_l <= ?", "rouge_l <= ?", max_rouge_l),
+            ("eval_mode = ?", "eval_mode = ?", eval_mode),
+        ]
+
+        for condition, _, value in filter_map:
+            if value is not None:
+                conditions.append(condition)
+                params.append(value)
 
         where = " AND ".join(conditions)
         params.append(limit)
@@ -265,6 +308,88 @@ class ResultStore:
         columns = [d[0] for d in desc] if desc else []
         return [dict(zip(columns, row)) for row in rows]
 
+    def export_json(self, run_id: str, file_path: str) -> int:
+        """Export a run's results to a JSON file.
+
+        Exports both individual results and the aggregate summary
+        in a single JSON document suitable for dashboards, reports,
+        or archiving.
+
+        Args:
+            run_id: Run to export.
+            file_path: Output file path (.json).
+
+        Returns:
+            Number of results exported.
+        """
+        results = self.query_results(run_id, limit=10000)
+        summary = self.get_run_summary(run_id)
+
+        export_data = {
+            "run_id": run_id,
+            "summary": {
+                "status": summary.status.value,
+                "sample_count": summary.sample_count,
+                "avg_precision": summary.avg_precision,
+                "avg_recall": summary.avg_recall,
+                "avg_f1": summary.avg_f1,
+                "avg_mrr": summary.avg_mrr,
+                "avg_ndcg": summary.avg_ndcg,
+                "avg_hit_rate": summary.avg_hit_rate,
+                "avg_faithfulness": summary.avg_faithfulness,
+                "avg_relevance": summary.avg_relevance,
+                "avg_correctness": summary.avg_correctness,
+                "avg_rouge_l": summary.avg_rouge_l,
+                "avg_context_utilization": summary.avg_context_utilization,
+                "avg_latency_ms": summary.avg_latency_ms,
+            },
+            "results": _serialize_results(results),
+        }
+
+        with open(file_path, "w") as f:
+            json.dump(export_data, f, indent=2, default=str)
+
+        logger.info("storage.exported_json", run_id=run_id, count=len(results), path=file_path)
+        return len(results)
+
+    def list_runs(self) -> list[dict[str, Any]]:
+        """List all evaluation runs with their sample counts.
+
+        Returns:
+            List of dicts with run_id and sample_count.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT run_id, COUNT(*) as sample_count,
+                   MIN(created_at) as first_result,
+                   MAX(created_at) as last_result
+            FROM eval_results
+            GROUP BY run_id
+            ORDER BY MIN(created_at) DESC
+            """
+        ).fetchall()
+
+        return [
+            {
+                "run_id": row[0],
+                "sample_count": row[1],
+                "first_result": str(row[2]),
+                "last_result": str(row[3]),
+            }
+            for row in rows
+        ]
+
     def close(self) -> None:
         """Close the database connection."""
         self._conn.close()
+
+
+def _serialize_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert DuckDB result rows to JSON-serializable dicts."""
+    serialized = []
+    for row in results:
+        clean: dict[str, Any] = {}
+        for key, value in row.items():
+            clean[key] = str(value) if hasattr(value, "isoformat") else value
+        serialized.append(clean)
+    return serialized
